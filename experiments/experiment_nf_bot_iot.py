@@ -1,0 +1,513 @@
+import json
+import random
+import socket
+import struct
+import warnings
+
+import category_encoders as ce
+import dgl
+import networkx as nx
+import numpy as np
+import pandas as pd
+import torch as th
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl.function as fn
+from dgl import from_networkx
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import class_weight
+from torch.optim import Adam
+from tqdm import tqdm
+
+import sys
+import os
+
+# 获取当前文件的绝对路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# 构建 module 目录的绝对路径（上一级目录的 module 文件夹）
+module_path = os.path.abspath(os.path.join(current_dir, '../module'))
+
+# 添加 module 目录到 sys.path
+sys.path.append(module_path)
+from efficientKan import KANLinear
+from CPCA2d import CPCABlock
+from SKNet import SKAttention
+from SCSA import SCSA
+from CBAM import CBAM
+
+from DFF2d import DFF
+from SDM2d import SDM
+from MSAF2d import MSAF
+from SFFusion2d import SqueezeAndExciteFusionAdd
+from TIF import TIF
+from WCMF import WCMF
+from GatedFusion import gatedFusion
+
+import pickle
+from data_preprocess import get_train_graph_file_path, get_test_graph_file_path, get_label_encoder_file_path, get_test_labels_file_path
+warnings.filterwarnings("ignore")
+
+# 定义加载 DGL 图的方法
+def load_graph(file_path):
+    return dgl.load_graphs(file_path)[0][0]
+
+# 定义计算准确度的函数
+def compute_accuracy(pred, labels):
+    return (pred.argmax(1) == labels).float().mean().item()
+
+# 定义计算 F1 score 的函数
+def compute_f1_score(pred, labels):
+    pred_labels = pred.argmax(1).cpu().numpy()
+    # 如果 labels 已经是 numpy 数组，则直接使用它
+    if isinstance(labels, np.ndarray):
+        true_labels = labels
+    else:
+        true_labels = labels.cpu().numpy()
+    return f1_score(true_labels, pred_labels, average='weighted')
+
+class SEAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super(SEAttention, self).__init__()
+        self.fc1 = nn.Linear(in_channels, in_channels // reduction)
+        self.fc2 = nn.Linear(in_channels // reduction, in_channels)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        squeeze = F.adaptive_avg_pool2d(x, (1, 1)).view(b, c)
+        excitation = F.relu(self.fc1(squeeze))
+        excitation = self.sigmoid(self.fc2(excitation)).view(b, c, 1, 1)
+        return x * excitation
+
+class SAGELayer(nn.Module):
+    def __init__(self, ndim_in, edims, ndim_out, activation, attention_name):
+        super(SAGELayer, self).__init__()
+        # 初始化SAGELayer类
+        # 定义消息传递的线性层，输入维度为节点特征和边特征之和，输出维度为指定的ndim_out
+        self.W_msg = nn.Linear(ndim_in + edims, ndim_out)
+        # 定义应用权重的线性层，输入维度为节点特征和消息传递输出之和，输出维度为指定的ndim_out
+        self.W_apply = nn.Linear(ndim_in + ndim_out, ndim_out)
+        # 保存激活函数
+        self.activation = activation
+
+        if attention_name == "SE":
+            self.attention = SEAttention(ndim_out)
+        elif attention_name == "SK":
+            self.attention = SKAttention(channel=ndim_out, reduction=8)
+        elif attention_name == "CPCA":
+            self.attention = CPCABlock(in_channels=ndim_out, out_channels=ndim_out, channelAttention_reduce=4)
+        elif attention_name == "SCSA":
+            self.attention = SCSA(dim=ndim_out)
+        elif attention_name == "CBAM":
+            self.attention = CBAM(ndim_out)
+        else:
+            self.attention = None
+
+    # 定义消息传递函数，edges是DGL中的边数据
+    def message_func(self, edges):
+        # 将源节点特征和边特征连接起来，并通过线性层转换
+        return {'m': self.W_msg(th.cat([edges.src['h'], edges.data['h']], 2))}
+
+    # 定义前向传播函数
+    def forward(self, g_dgl, nfeats, efeats):
+        with g_dgl.local_scope():
+            g = g_dgl
+            # 设置节点特征和边特征
+            g.ndata['h'] = nfeats
+            g.edata['h'] = efeats
+            # 执行消息传递和聚合操作，更新节点特征
+            g.update_all(self.message_func, fn.mean('m', 'h_neigh'))
+
+            # 先进行消息聚合，然后执行注意力机制
+            if self.attention == None:
+                aggregated_feats = g.ndata['h_neigh']
+            else:
+                aggregated_feats = g.ndata['h_neigh'].view(g.ndata['h_neigh'].size(0), -1, 1, 1)
+                aggregated_feats = self.attention(aggregated_feats).view(g.ndata['h_neigh'].size(0), 1, -1)
+            # 将融合后的特征与原始特征连接，并通过线性层进行转换和激活
+            g.ndata['h'] = F.relu(self.W_apply(th.cat([g.ndata['h'], aggregated_feats], 2)))
+            # 返回更新后的节点特征
+            return g.ndata['h']
+
+# 定义一个SAGE类，继承自nn.Module
+class SAGE(nn.Module):
+    def __init__(self, ndim_in, ndim_out, edim, activation, dropout, attention_name):
+        super(SAGE, self).__init__()
+        # 初始化SAGE类
+        # 创建一个ModuleList来存储SAGELayer层
+        self.layers = nn.ModuleList()
+        # 添加第一层SAGELayer，输入维度为ndim_in，输出维度为128
+        self.layers.append(SAGELayer(ndim_in, edim, 128, activation, attention_name))
+        # 添加第二层SAGELayer，输入维度为128，输出维度为ndim_out
+        self.layers.append(SAGELayer(128, edim, ndim_out, activation, attention_name))
+        # 定义dropout层，使用指定的dropout率
+        self.dropout = nn.Dropout(p=dropout)
+
+    # 定义前向传播函数
+    def forward(self, g, nfeats, efeats):
+        # 遍历每一层SAGELayer
+        for i, layer in enumerate(self.layers):
+            # 除第一层外，在输入到下一层前应用dropout
+            if i != 0:
+                nfeats = self.dropout(nfeats)
+            # 执行SAGELayer的前向传播
+            nfeats = layer(g, nfeats, efeats)
+        # 返回每个节点特征的和
+        return nfeats.sum(1)
+
+# 定义一个MLPPredictor类，继承自nn.Module
+class MLPPredictor(nn.Module):
+    def __init__(self, in_features, out_classes, fusion_name, mlp_name):
+        super().__init__()
+        # 初始化MLPPredictor类
+        # 定义线性层，输入维度为两倍的节点特征维度，输出维度为指定的类别数
+        self.mlp_name = mlp_name
+        self.fusion_name = fusion_name
+
+        if fusion_name == "DFF":
+            self.fusion = DFF(in_features)
+        elif fusion_name == "MSAF":
+            self.fusion = MSAF(channels=in_features, r=4)
+        elif fusion_name == "SDM":
+            self.fusion = SDM(in_channel=in_features, guidance_channels=in_features)
+        elif fusion_name == "SFF":
+            self.fusion = SqueezeAndExciteFusionAdd(channels_in=in_features)
+        elif fusion_name == "TIF":
+            self.fusion = TIF(dim_s=in_features, dim_l=in_features)
+        elif fusion_name == "WCMF":
+            self.fusion = WCMF(channel=in_features)
+        elif fusion_name == "GATE":
+            self.fusion = gatedFusion(in_features)
+        else:
+            self.fusion = None
+
+        if mlp_name == "KAN":
+            # 第一层 KANLinear，输入维度为两倍的节点特征维度
+            self.fc1 = KANLinear(in_features * 2, in_features)
+            # 激活函数
+            self.relu = nn.ReLU()
+            # 第二层 KANLinear，输出维度为指定的类别数
+            self.fc2 = KANLinear(in_features, out_classes)
+        elif mlp_name == "MLP":
+            self.W = nn.Linear(in_features * 2, out_classes)
+
+    # 定义边应用函数，edges是DGL中的边数据
+    def apply_edges(self, edges):
+        # 获取源节点特征
+        h_u = edges.src['h']
+        # 获取目标节点特征
+        h_v = edges.dst['h']
+
+        # 执行特征融合
+        if self.fusion != None:
+            if self.fusion_name == "GATE":
+                input1 = h_u.view(h_u.size(0), 1, 1, -1)
+                input2 = h_v.view(h_v.size(0), 1, 1, -1)
+            else:
+                input1 = h_u.view(h_u.size(0), -1, 1, 1)
+                input2 = h_v.view(h_v.size(0), -1, 1, 1)
+            h_u = self.fusion(input1, input2).view(h_u.size(0), -1)
+
+        # 将源节点和目标节点的特征连接起来，通过线性层转换
+        if self.mlp_name == "KAN":
+            # 将源节点和目标节点的特征连接起来，通过线性层转换
+            combined_features = th.cat([h_u, h_v], 1)
+
+            # 通过两层 KANLinear 进行特征转换
+            x = self.fc1(combined_features)
+            x = self.relu(x)
+            score = self.fc2(x)
+        elif self.mlp_name == "MLP":
+            score = self.W(th.cat([h_u, h_v], 1))
+
+        # 返回包含预测得分的字典
+        return {'score': score}
+
+    # 定义前向传播函数
+    def forward(self, graph, h):
+        with graph.local_scope():
+            # 使用local_scope保护当前图数据不被修改
+            # 设置节点特征
+            graph.ndata['h'] = h
+            # 应用边上的计算函数，将预测得分存储在边数据中
+            graph.apply_edges(self.apply_edges)
+            # 返回边数据中的预测得分
+            return graph.edata['score']
+
+# 定义一个Model类，继承自nn.Module
+class Model(nn.Module):
+    def __init__(self, ndim_in, ndim_out, edim, activation, dropout, attention_name, fusion_name, mlp_name, output_classes):
+        super().__init__()
+        # 初始化Model类
+        # 创建一个SAGE模型，用于图神经网络层
+        self.gnn = SAGE(ndim_in, ndim_out, edim, activation, dropout, attention_name)
+        # 创建一个MLPPredictor模型，用于边的预测
+        self.pred = MLPPredictor(ndim_out, output_classes, fusion_name, mlp_name)
+
+    # 定义前向传播函数
+    def forward(self, g, nfeats, efeats):
+        # 使用SAGE模型进行节点特征的计算
+        h = self.gnn(g, nfeats, efeats)
+        # 使用MLPPredictor模型进行边的预测，并返回预测结果
+        return self.pred(g, h)
+
+# 定义实验参数
+dataset = 'NF-BoT-IoT'
+'''
+attention 方法：
+    - SE: Squeeze-and-Excitation
+    - SK: Selective Kernel
+    - CPCA: Channel-wise PCA
+    - SCSA: Spatial and Channel Squeeze & Excitation
+    - CBAM: Convolutional Block Attention Module
+'''
+attention_name = "SK"
+
+'''
+fusion 方法:
+    - DFF: DFF
+    - SDM: SDM
+    - SFF: SFFusion
+    - TIF: TIF
+    - WCMF: WCMF
+    - GATE: GatedFusion
+'''
+fusion_name = "GATE"
+
+'''
+mlp 方法：
+    - KAN: KAN
+    - MLP: MLP
+'''
+mlp_name = "KAN"
+
+if dataset == 'NF-BoT-IoT' or dataset == 'NF-BoT-IoT-v2':
+    output_classes = 5
+elif dataset == "NF-CSE-CIC-IDS2018-v2":
+    output_classes = 15
+else:
+    output_classes = 10
+
+epochs = 1000
+best_model_file_path = f'./model/{attention_name}_{fusion_name}_{mlp_name}_{dataset}_best_model.pth'
+report_file_path = f'./reports/{attention_name}_{fusion_name}_{mlp_name}_{dataset}_report.json'
+test_pred_file_path = f'./predictions/{attention_name}_{fusion_name}_{mlp_name}_{dataset}_test_pred.pth'
+
+# 打印出所有实验配置
+print(f'Dataset: {dataset}')
+print(f'Attention: {attention_name}')
+print(f'Fusion: {fusion_name}')
+print(f'MLP: {mlp_name}')
+print(f'Epochs: {epochs}')
+print(f'Best model file path: {best_model_file_path}')
+print(f'Report file path: {report_file_path}')
+
+# 获取图
+G = load_graph(get_train_graph_file_path(dataset))
+# 获取测试图
+G_test = load_graph(get_test_graph_file_path(dataset))
+# 获取测试标签
+actual = np.load(get_test_labels_file_path(dataset))
+# 获取标签编码器
+with open(get_label_encoder_file_path(dataset), 'rb') as f:
+    le_label = pickle.load(f)
+
+
+# 将节点特征重塑为三维张量
+# 原始节点特征维度为 (num_nodes, feature_dim)
+# 重塑后的维度为 (num_nodes, 1, feature_dim)
+G.ndata['h'] = th.reshape(G.ndata['h'], (G.ndata['h'].shape[0], 1, G.ndata['h'].shape[1]))
+
+# 将边特征重塑为三维张量
+# 原始边特征维度为 (num_edges, feature_dim)
+# 重塑后的维度为 (num_edges, 1, feature_dim)
+G.edata['h'] = th.reshape(G.edata['h'], (G.edata['h'].shape[0], 1, G.edata['h'].shape[1]))
+
+# 重塑测试图的节点特征为三维张量
+# 原始节点特征维度为 (num_nodes, feature_dim)
+# 重塑后的维度为 (num_nodes, 1, feature_dim)
+G_test.ndata['feature'] = th.reshape(G_test.ndata['feature'], (G_test.ndata['feature'].shape[0], 1, G_test.ndata['feature'].shape[1]))
+
+# 重塑测试图的边特征为三维张量
+# 原始边特征维度为 (num_edges, feature_dim)
+# 重塑后的维度为 (num_edges, 1, feature_dim)
+G_test.edata['h'] = th.reshape(G_test.edata['h'], (G_test.edata['h'].shape[0], 1, G_test.edata['h'].shape[1]))
+
+# 从图的边属性中提取标签并转换为 numpy 数组
+edge_labels = G.edata['label'].cpu().numpy()
+
+# 获取边标签的唯一值
+unique_labels = np.unique(edge_labels)
+
+# 计算每个类的权重，以处理类别不平衡问题
+class_weights = class_weight.compute_class_weight('balanced',
+                                                  classes=unique_labels,
+                                                  y=edge_labels)
+
+# 首先，根据是否有 CUDA 可用来设置设备
+device = th.device("cuda" if th.cuda.is_available() else "cpu")
+
+# 将 class_weights 转换为浮点张量，并根据设备选择移动到 GPU 或保持在 CPU 上
+class_weights = th.FloatTensor(class_weights).to(device)
+
+# 初始化损失函数，使用计算的类权重
+criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+G = G.to(device)
+
+# 获取节点特征和边特征
+node_features = G.ndata['h']
+edge_features = G.edata['h']
+
+# 获取边标签和训练掩码
+edge_label = G.edata['label']
+train_mask = G.edata['train_mask']
+
+# 将模型移动到设备上（GPU 或 CPU）
+model = Model(ndim_in=G.ndata['h'].shape[2], ndim_out=128, edim=G.ndata['h'].shape[2], activation=F.relu, dropout=0.2, attention_name=attention_name, fusion_name=fusion_name, mlp_name=mlp_name, output_classes=output_classes).to(device)
+
+# 将节点特征和边特征移动到设备上
+node_features = node_features.to(device)
+edge_features = edge_features.to(device)
+edge_label = edge_label.to(device)
+train_mask = train_mask.to(device)
+
+# 定义优化器
+opt = Adam(model.parameters())
+
+# 变量用于保存最高的 F1 score
+best_f1_score = 0.0
+
+# 将测试图移动到设备（GPU 或 CPU）
+G_test = G_test.to(device)
+
+import timeit
+
+# 记录开始时间
+start_time = timeit.default_timer()
+
+# 获取测试图的节点特征和边特征
+node_features_test = G_test.ndata['feature']
+edge_features_test = G_test.edata['h']
+
+# 训练循环
+'''
+for epoch in tqdm(range(1, epochs + 1), desc="Training Epochs"):
+    # 前向传播，获取预测值
+    pred = model(G, node_features, edge_features)
+
+    # 计算损失，只考虑训练掩码内的边
+    loss = criterion(pred[train_mask], edge_label[train_mask])
+
+    # 清零梯度
+    opt.zero_grad()
+
+    # 反向传播，计算梯度
+    loss.backward()
+
+    # 更新模型参数
+    opt.step()
+
+    # 每 100 轮输出一次训练准确度和 F1 score
+    if epoch % 100 == 0:
+        accuracy = compute_accuracy(pred[train_mask], edge_label[train_mask])
+        f1 = compute_f1_score(pred[train_mask], edge_label[train_mask])
+        print(f'Epoch {epoch}: Training acc: {accuracy}, F1 score: {f1}')
+
+    # 计算当前模型的 F1 score，如果高于最高的 F1 score，则保存模型和图
+    model.eval()  # 切换到评估模式
+    with th.no_grad():  # 禁用梯度计算
+        test_pred = model(G_test, node_features_test, edge_features_test)
+        current_f1_score = compute_f1_score(test_pred, actual)
+        if current_f1_score > best_f1_score:
+            best_f1_score = current_f1_score
+            th.save(model, best_model_file_path)
+            print(f'New best model and graph saved at epoch {epoch} with F1 score: {best_f1_score}')
+'''
+
+# 进行前向传播，获取测试预测
+# 将模型移动到设备上（GPU 或 CPU）
+best_model = th.load(best_model_file_path,  map_location=th.device('cpu'))
+best_model = best_model.to(device)
+best_model.eval()
+test_pred = best_model(G_test, node_features_test, edge_features_test).to(device)
+
+# 保存test_pred到本地
+th.save(test_pred, test_pred_file_path)
+
+# 计算并打印前向传播所花费的时间
+elapsed = timeit.default_timer() - start_time
+print(str(elapsed) + ' seconds')
+
+# 获取预测标签
+test_pred = test_pred.argmax(1)
+
+# 将预测结果从 GPU 移动到 CPU，并转换为 numpy 数组
+test_pred = test_pred.cpu().detach().numpy()
+
+actual = le_label.inverse_transform(actual)
+test_pred = le_label.inverse_transform(test_pred)
+
+# 打印详细的分类报告
+report = classification_report(actual, test_pred, target_names=np.unique(actual), output_dict=True)
+# 保存分类报告为JSON文件
+with open(report_file_path, 'w') as jsonfile:
+    json.dump(report, jsonfile, indent=4)
+
+print(report)
+
+# 定义绘制混淆矩阵的函数
+def plot_confusion_matrix(cm,
+                          target_names,
+                          title='Confusion matrix',
+                          cmap=None,
+                          normalize=True):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import itertools
+
+    accuracy = np.trace(cm) / float(np.sum(cm))
+    misclass = 1 - accuracy
+
+    if cmap is None:
+        cmap = plt.get_cmap('Blues')
+
+    plt.figure(figsize=(12, 12))
+    plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.title(title)
+    plt.colorbar()
+
+    if target_names is not None:
+        tick_marks = np.arange(len(target_names))
+        plt.xticks(tick_marks, target_names, rotation=45)
+        plt.yticks(tick_marks, target_names)
+
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+    thresh = cm.max() / 1.5 if normalize else cm.max() / 2
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        if normalize:
+            plt.text(j, i, "{:0.4f}".format(cm[i, j]),
+                     horizontalalignment="center",
+                     color="white" if cm[i, j] > thresh else "black")
+        else:
+            plt.text(j, i, "{:,}".format(cm[i, j]),
+                     horizontalalignment="center",
+                     color="white" if cm[i, j] > thresh else "black")
+
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label\naccuracy={:0.4f}; misclass={:0.4f}'.format(accuracy, misclass))
+    plt.show()
+
+# 绘制混淆矩阵
+cm = confusion_matrix(actual, test_pred)
+plot_confusion_matrix(cm=cm,
+                      normalize=False,
+                      target_names=np.unique(actual),
+                      title="Confusion Matrix")
